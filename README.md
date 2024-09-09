@@ -1,7 +1,7 @@
 
 # Abbreviation Extractor
 
-Abbreviation Extractor is a high-performance Rust library with Python bindings for extracting abbreviation-definition pairs from text, particularly focused on biomedical text. It implements an improved version of the [Schwartz-Hearst algorithm](https://psb.stanford.edu/psb-online/proceedings/psb03/schwartz.pdf), offering enhanced accuracy and speed. It's based the original [python implementation](https://github.com/philgooch).
+Abbreviation Extractor is a high-performance Rust library with Python bindings for extracting abbreviation-definition pairs from text, particularly focused on biomedical text. It implements an improved version of the [Schwartz-Hearst algorithm](https://psb.stanford.edu/psb-online/proceedings/psb03/schwartz.pdf), offering enhanced accuracy and speed. It's based the original [python implementation](https://github.com/philgooch/abbreviation-extraction).
 
 [Speed Comparison With Other Abbreviation Extraction Libraries](#performance-comparison-of-abbreviation-extractor-against-other-libraries)
 
@@ -155,4 +155,4 @@ This library is based on the Schwartz-Hearst algorithm:
 
 [A. Schwartz and M. Hearst (2003) A Simple Algorithm for Identifying Abbreviations Definitions in Biomedical Text. Biocomputing, 451-462.](https://psb.stanford.edu/psb-online/proceedings/psb03/schwartz.pdf)
 
-The implementation is inspired by the original Python variant by Phil Gooch: [abbreviation-extractor](https://github.com/philgooch/abbreviations)
+The implementation is inspired by the original Python variant by Phil Gooch: [abbreviation-extractor](https://github.com/philgooch/abbreviation-extraction)
