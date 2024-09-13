@@ -1,6 +1,6 @@
 [package]
 name = "abbreviation_extractor"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Praise Oketola <oketola.praise@gmail.com>"]
 description = "A library for extracting abbreviations from text."
@@ -34,4 +34,3 @@ harness = false
 
 [profile.bench]
 debug = true
-

@@ -56,6 +56,9 @@ pub fn extract_abbreviation_definition_pairs<'a>(
     text: &'a str,
     options: AbbreviationOptions,
 ) -> Vec<AbbreviationDefinition> {
+    if text.is_empty() {
+        return Vec::new();
+    }
     // Iterate over each sentence in the input text
     // Choose the appropriate iterator based on the 'tokenized' flag
     let sentences: Vec<Cow<'a, str>> = if options.tokenize {
@@ -386,12 +389,12 @@ pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
                 // Extract the candidate from within the parentheses
                 let start = open_index + 1;
                 let stop = close_index - 1;
-                let candidate_text = &sentence[start..stop];
+                let candidate_text = safe_slice(sentence, start, stop);
 
                 // Take into account whitespace that should be removed
                 let start = start + candidate_text.len() - candidate_text.trim_start().len();
                 let stop = stop - candidate_text.len() + candidate_text.trim_end().len();
-                let candidate = &sentence[start..stop];
+                let candidate = safe_slice(sentence, start, stop);
 
                 // Check if the candidate meets certain conditions
                 if conditions(&candidate) {
@@ -422,7 +425,12 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
     let tokens: Vec<&str> = WORD_SPLIT_RE.split(&lowercase_sentence).collect();
 
     // Get the first character of the candidate (the key we're looking for)
-    let key = candidate.text().chars().next()?.to_lowercase().next()?;
+    let key = candidate
+        .text()
+        .chars()
+        .next()
+        .and_then(|c| c.to_lowercase().next())
+        .unwrap_or('\0'); // Default to null character if no key is found
 
     // Create a vector of the first characters of each token
     let first_chars: Vec<char> = tokens.iter().filter_map(|t| t.chars().next()).collect();
@@ -462,9 +470,18 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
 
             // Check if the potential definition starts with a preposition or conjunction
             let sniffer_start = tokens[..start_index as usize].join(" ").len();
-            let preposition =
-                sentence[sniffer_start..min(sniffer_start + 4, sentence.len())].trim();
-            if PREPOSITIONS.is_match(preposition) {
+            // extract up to 4 characters from the sentence starting at sniffer_start, handling Unicode also
+            let preposition = match sentence.get(sniffer_start..) {
+                Some(s) => s
+                    .char_indices()
+                    .take(4)
+                    .map(|(_, c)| c)
+                    .collect::<String>()
+                    .trim()
+                    .to_string(),
+                None => String::new(),
+            };
+            if PREPOSITIONS.is_match(&preposition) {
                 // If it does, adjust our search
                 start -= 1;
                 if start_index == 0 {
@@ -488,13 +505,13 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
     // We found enough keys in the definition, so construct the definition candidate
     let start = tokens[..start_index as usize].join(" ").len();
     let stop = candidate.start() - 1;
-    let mut candidate_text = &sentence[start..stop];
+    let mut candidate_text = safe_slice(sentence, start, stop);
 
     // Remove leading and trailing whitespace
     let mut start = start + candidate_text.len() - candidate_text.trim_start().len();
     let stop = stop - candidate_text.len() + candidate_text.trim_end().len();
 
-    if !best_candidates(&sentence[start..stop]).is_empty() {
+    if !best_candidates(safe_slice(sentence, start, stop)).is_empty() {
         return None;
     }
 
@@ -506,7 +523,7 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         }
         start = hyphen_index;
     }
-    candidate_text = &sentence[start..stop];
+    candidate_text = safe_slice(sentence, start, stop);
 
     // Return the definition as a new Candidate
     Some(Candidate::new(candidate_text, start, stop))
@@ -686,6 +703,10 @@ fn walk_backwards(def_chars: &Vec<char>, start: isize) -> isize {
     }
 
     index
+}
+
+fn safe_slice(s: &str, start: usize, end: usize) -> &str {
+    s.get(start..end).unwrap_or("")
 }
 
 #[cfg(test)]
@@ -1165,5 +1186,32 @@ Fifth sentence with trailing newline.
             .collect();
 
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_unicode_chars() {
+        let text = r#""Two kinds of mechanical valve, St. Jude Medical (SJM) and Björk-Shiley (B-S), in patients with single valve replacement have been evaluated on a view point of intravascular hemolysis.
+The World Health Organization (WHO) works globally. La Société Nationale des Chemins de fer Français (SNCF) est l'entreprise ferroviaire publique française.,
+Em português, a Organização Mundial da Saúde (OMS) é muito importante.,
+Всемирная организация здравоохранения (Воз) работает во всем мире.",
+The Société Générale des Surveillances (SGS) is a multinational company.,
+Το Ινστιτούτο Τεχνολογίας Υπολογιστών και Εκδόσεων (ΙΤΥΕ) είναι ερευνητικός οργανισμός.",
+"#;
+        let options = AbbreviationOptions::default();
+
+        run_extraction_test(
+            text,
+            vec![
+                ("SJM", "St. Jude Medical"),
+                ("B-S", "Björk-Shiley"),
+                ("WHO", "World Health Organization"),
+                ("SNCF", "Société Nationale des Chemins de fer Français"),
+                ("OMS", "Organização Mundial da Saúde"),
+                ("Воз", "Всемирная организация здравоохранения"),
+                ("SGS", "Société Générale des Surveillances"),
+                ("ΙΤΥΕ", "Ινστιτούτο Τεχνολογίας Υπολογιστών και Εκδόσεων"),
+            ],
+            options,
+        );
     }
 }
