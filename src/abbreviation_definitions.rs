@@ -2,6 +2,8 @@ use bincode::{deserialize, serialize};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
+use std::fmt;
+use std::error::Error;
 
 /// Represents an abbreviation-definition pair with its position in the text.
 #[pyclass]
@@ -121,6 +123,18 @@ pub enum ExtractionError {
     IOError(String),
     ThreadPoolError(String),
 }
+
+impl fmt::Display for ExtractionError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            ExtractionError::ProcessingError(msg) => write!(f, "Processing error: {}", msg),
+            ExtractionError::IOError(msg) => write!(f, "IO error: {}", msg),
+            ExtractionError::ThreadPoolError(msg) => write!(f, "Thread pool error: {}", msg),
+        }
+    }
+}
+
+impl Error for ExtractionError {}
 
 #[pyclass]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
