@@ -8,6 +8,7 @@ license = "MIT"
 repository = "https://github.com/praise2112/abbreviation-extractor"
 keywords = ["abbreviation", "extraction", "nlp", "text-processing", "biomedical"]
 categories = ["text-processing", "science", "algorithms"]
+exclude = ["benches/pubmed_abstracts_20240801_to_20240809.txt"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 [lib]
