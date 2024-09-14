@@ -21,14 +21,14 @@ Abbreviation Extractor is a high-performance Rust library with Python bindings f
 Add this to your `Cargo.toml`:
 
 ```toml
-abbreviation-extractor = "0.1.1"
+abbreviation-extractor = "0.1.3"
 ```
 
 ### Python
 
 pip install abbreviation-extractor-rs
 
-## Usage
+## Basic Usage
 
 ### Rust
 
@@ -103,6 +103,93 @@ let result = extract_abbreviation_definition_pairs(text, options);
 for pair in result {
     println!("Abbreviation: {}, Definition: {}", pair.abbreviation, pair.definition);
 }
+```
+
+
+## Parallel Processing
+
+For processing multiple texts in parallel, you can use the `extract_abbreviation_definition_pairs_parallel` function:
+
+### Rust
+
+```rust
+use abbreviation_extractor::{extract_abbreviation_definition_pairs_parallel, AbbreviationOptions};
+
+let texts = vec![
+    "The World Health Organization (WHO) is a specialized agency.",
+    "The United Nations (UN) works closely with WHO.",
+    "The European Union (EU) is a political and economic union.",
+];
+
+let options = AbbreviationOptions::default();
+let result = extract_abbreviation_definition_pairs_parallel(texts, options);
+
+for extraction in result.extractions {
+    println!("Abbreviation: {}, Definition: {}", extraction.abbreviation, extraction.definition);
+}
+```
+
+### Python
+
+```python
+from abbreviation_extractor import extract_abbreviation_definition_pairs_parallel
+
+texts = [
+    "The World Health Organization (WHO) is a specialized agency.",
+    "The United Nations (UN) works closely with WHO.",
+    "The European Union (EU) is a political and economic union.",
+]
+
+result = extract_abbreviation_definition_pairs_parallel(texts)
+
+for extraction in result.extractions:
+    print(f"Abbreviation: {extraction.abbreviation}, Definition: {extraction.definition}")
+```
+
+## Processing Large Files
+
+For extracting abbreviations from large files, you can use the `extract_abbreviations_from_file` function:
+
+### Rust
+
+```rust
+use abbreviation_extractor::{extract_abbreviations_from_file, AbbreviationOptions, FileExtractionOptions};
+
+let file_path = "path/to/your/large/file.txt";
+let abbreviation_options = AbbreviationOptions::default();
+let file_options = FileExtractionOptions::default();
+
+let result = extract_abbreviations_from_file(file_path, abbreviation_options, file_options);
+
+for extraction in result.extractions {
+    println!("Abbreviation: {}, Definition: {}", extraction.abbreviation, extraction.definition);
+}
+```
+
+### Python
+
+```python
+from abbreviation_extractor import extract_abbreviations_from_file
+
+file_path = "path/to/your/large/file.txt"
+result = extract_abbreviations_from_file(file_path)
+
+for extraction in result.extractions:
+    print(f"Abbreviation: {extraction.abbreviation}, Definition: {extraction.definition}")
+```
+
+You can customize the file extraction process by specifying additional parameters:
+
+```python
+result = extract_abbreviations_from_file(
+    file_path,
+    most_common_definition=True,
+    first_definition=False,
+    tokenize=True,
+    num_threads=4,
+    show_progress=True,
+    chunk_size=2048 * 1024  # 2MB chunks
+)
 ```
 
 # Benchmark

@@ -11,6 +11,7 @@ lazy_static! {
     pub static ref LONG_LOWER_CASE: Regex = Regex::new(r"^\p{Ll}{7,}$").unwrap();
     /// Sentence tokenizer for English text
     static ref TOKENIZATION_DATA: TrainingData = TrainingData::english();
+    static ref WHITESPACE_REGEX: Regex = Regex::new(r"\s+").unwrap();
 
 }
 
@@ -109,7 +110,7 @@ pub fn conditions(candidate: &str) -> bool {
 pub fn tokenize_and_clean<'a>(text: &'a str) -> impl Iterator<Item = Cow<'a, str>> + 'a {
     SentenceTokenizer::<Standard>::new(text, &TOKENIZATION_DATA).map(|sent| {
         if sent.contains('\n') {
-            Cow::Owned(sent.replace('\n', " ").trim().to_string())
+            Cow::Owned(WHITESPACE_REGEX.replace_all(sent.trim(), " ").into_owned())
         } else {
             Cow::Borrowed(sent.trim())
         }

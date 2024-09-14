@@ -1,6 +1,6 @@
 [package]
 name = "abbreviation_extractor"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 authors = ["Praise Oketola <oketola.praise@gmail.com>"]
 description = "A library for extracting abbreviations from text."
@@ -23,6 +23,10 @@ rayon = "1.10.0"
 serde = { version = "1.0.209", features = ["derive"] }
 bincode = "1.3.3"
 punkt_n = "1.0.5"
+log = "0.4.22"
+pyo3-log = "0.11.0"
+num_cpus = "1.16.0"
+indicatif = "0.17.8"
 
 [dev-dependencies]
 criterion = "0.5.1"

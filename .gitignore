@@ -75,3 +75,4 @@ benches/benchmark_accuracy.py
 *.svg
 *.data
 flamegraph.svg
+!benches/pubmed_abstracts_20240801_to_20240809.txt

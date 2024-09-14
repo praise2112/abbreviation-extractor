@@ -9,13 +9,21 @@ use crate::utils::{conditions, tokenize_and_clean, PREPOSITIONS};
 use crate::Candidate;
 use lazy_static::lazy_static;
 
-use crate::abbreviation_definitions::{AbbreviationDefinition, AbbreviationOptions};
+use crate::abbreviation_definitions::{
+    AbbreviationDefinition, AbbreviationOptions, ExtractionError, ExtractionResult,
+    FileExtractionOptions,
+};
+use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::cmp::min;
-use std::sync::Arc;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::panic::AssertUnwindSafe;
+use std::sync::{mpsc, Arc, Mutex};
+use std::{panic, thread};
 
 lazy_static! {
     /// Regular expression for splitting words on whitespace or hyphens
@@ -24,35 +32,7 @@ lazy_static! {
     static ref CLEAN_SENTENCE_RE: Regex = Regex::new(r#"(\()['"\p{Pi}]|['"\p{Pf}]([);:])"#).unwrap();
 }
 
-/// Extracts abbreviation-definition pairs from a given text.
-///
-/// # Arguments
-///
-/// * `text` - The input text to extract abbreviations from.
-/// * `options` - An `AbbreviationOptions` struct containing extraction options:
-///   - `most_common_definition`: If true, only the most common definition for each abbreviation is returned.
-///   - `first_definition`: If true, only the first definition for each abbreviation is returned.
-///   - `tokenized`: If true, the input text is assumed to be pre-tokenized into sentences.
-///
-/// # Returns
-///
-/// A vector of `AbbreviationDefinition` structs representing the extracted pairs.
-///
-/// # Example
-///
-/// ```
-/// use abbreviation_extractor::{extract_abbreviation_definition_pairs, AbbreviationOptions};
-///
-/// let text = "The World Health Organization (WHO) is a specialized agency. \
-///             WHO is responsible for international public health.";
-/// let options = AbbreviationOptions::default();
-/// let result = extract_abbreviation_definition_pairs(text, options);
-///
-/// assert_eq!(result.len(), 1);
-/// assert_eq!(result[0].abbreviation, "WHO");
-/// assert_eq!(result[0].definition, "World Health Organization");
-/// ```
-pub fn extract_abbreviation_definition_pairs<'a>(
+pub fn extract_abbreviation_definition_pairs_wrapper<'a>(
     text: &'a str,
     options: AbbreviationOptions,
 ) -> Vec<AbbreviationDefinition> {
@@ -92,6 +72,51 @@ pub fn extract_abbreviation_definition_pairs<'a>(
     } else {
         abbreviations
     }
+}
+
+/// Extracts abbreviation-definition pairs from a given text.
+///
+/// # Arguments
+///
+/// * `text` - The input text to extract abbreviations from.
+/// * `options` - An `AbbreviationOptions` struct containing extraction options:
+///   - `most_common_definition`: If true, only the most common definition for each abbreviation is returned.
+///   - `first_definition`: If true, only the first definition for each abbreviation is returned.
+///   - `tokenized`: If true, the input text is assumed to be pre-tokenized into sentences.
+///
+/// # Returns
+///
+/// A vector of `AbbreviationDefinition` structs representing the extracted pairs.
+///
+/// # Example
+///
+/// ```
+/// use abbreviation_extractor::{extract_abbreviation_definition_pairs, AbbreviationOptions};
+///
+/// let text = "The World Health Organization (WHO) is a specialized agency. \
+///             WHO is responsible for international public health.";
+/// let options = AbbreviationOptions::default();
+/// let result = extract_abbreviation_definition_pairs(text, options).unwrap();
+///
+/// assert_eq!(result.len(), 1);
+/// assert_eq!(result[0].abbreviation, "WHO");
+/// assert_eq!(result[0].definition, "World Health Organization");
+/// ```
+pub fn extract_abbreviation_definition_pairs(
+    text: &str,
+    options: AbbreviationOptions,
+) -> Result<Vec<AbbreviationDefinition>, ExtractionError> {
+    panic::catch_unwind(AssertUnwindSafe(|| {
+        extract_abbreviation_definition_pairs_wrapper(text, options)
+    }))
+    .map_err(|panic_error| {
+        let error_msg = panic_error
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| panic_error.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "Unknown panic occurred during abbreviation extraction".to_string());
+        ExtractionError::ProcessingError(error_msg)
+    })
 }
 
 fn process_sentence(sentence: &str) -> Vec<AbbreviationDefinition> {
@@ -151,14 +176,14 @@ fn process_sentence(sentence: &str) -> Vec<AbbreviationDefinition> {
 /// let options = AbbreviationOptions::default();
 /// let result = extract_abbreviation_definition_pairs_parallel(texts, options);
 /// println!("{:?}", result);
-/// assert_eq!(result.len(), 2);
-/// assert!(result.iter().any(|ad| ad.abbreviation == "NASA" && ad.definition == "National Aeronautics and Space Administration"));
-/// assert!(result.iter().any(|ad| ad.abbreviation == "ESA" && ad.definition == "European Space Agency"));
+/// assert_eq!(result.extractions.len(), 2);
+/// assert!(result.extractions.iter().any(|ad| ad.abbreviation == "NASA" && ad.definition == "National Aeronautics and Space Administration"));
+/// assert!(result.extractions.iter().any(|ad| ad.abbreviation == "ESA" && ad.definition == "European Space Agency"));
 /// ```
 pub fn extract_abbreviation_definition_pairs_parallel<T>(
     texts: Vec<T>,
     options: AbbreviationOptions,
-) -> Vec<AbbreviationDefinition>
+) -> ExtractionResult
 where
     T: AsRef<str> + Sync,
 {
@@ -169,36 +194,289 @@ where
         .collect();
 
     // Process each text in parallel
-    let all_results: Vec<Vec<AbbreviationDefinition>> = texts
+    let results: Vec<Result<Vec<AbbreviationDefinition>, ExtractionError>> = texts
         .par_iter()
         .map(|text| {
-            // Collect sentences into a Vec<Cow<str>>
-            let sentences: Vec<Cow<str>> = if options.tokenize {
-                tokenize_and_clean(text).collect()
-            } else {
-                text.split('\n').map(Cow::Borrowed).collect()
-            };
+            panic::catch_unwind(AssertUnwindSafe(|| {
+                // Collect sentences into a Vec<Cow<str>>
+                let sentences: Vec<Cow<str>> = if options.tokenize {
+                    tokenize_and_clean(text).collect()
+                } else {
+                    text.split('\n').map(Cow::Borrowed).collect()
+                };
 
-            // Process sentences
-            sentences
-                .into_par_iter()
-                .flat_map(|sentence| process_sentence(&sentence))
-                .collect()
+                // Process sentences
+                sentences
+                    .into_par_iter()
+                    .flat_map(|sentence| process_sentence(&sentence))
+                    .collect()
+            }))
+            .map_err(|panic_error| {
+                let error_msg = panic_error
+                    .downcast_ref::<&str>()
+                    .map(|s| s.to_string())
+                    .or_else(|| panic_error.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| {
+                        "Unknown panic occurred during abbreviation extraction".to_string()
+                    });
+                ExtractionError::ProcessingError(error_msg)
+            })
         })
         .collect();
 
-    // Merge results from all texts
-    let mut merged_results: Vec<AbbreviationDefinition> =
-        all_results.into_iter().flatten().collect();
+    // Separate successful extractions and errors
+    let mut all_extractions = Vec::new();
+    let mut all_errors = Vec::new();
 
-    // Select final definitions based on the specified criteria
-    if options.most_common_definition {
-        merged_results = select_most_common_definitions(merged_results);
-    } else if options.first_definition {
-        merged_results = select_first_definitions(merged_results);
+    for result in results {
+        match result {
+            Ok(extractions) => all_extractions.extend(extractions),
+            Err(error) => all_errors.push(error),
+        }
     }
 
-    merged_results
+    // Apply post-processing based on options
+    let final_extractions = if options.most_common_definition {
+        select_most_common_definitions(all_extractions)
+    } else if options.first_definition {
+        select_first_definitions(all_extractions)
+    } else {
+        all_extractions
+    };
+
+    ExtractionResult {
+        extractions: final_extractions,
+        errors: all_errors,
+    }
+}
+
+/// Extracts abbreviations from a file safely, using parallel processing.
+///
+/// This function reads a file in chunks, processes each chunk to extract abbreviations,
+/// and handles potential errors and panics that may occur during processing.
+///
+/// # Arguments
+///
+/// * `filename` - A string slice that holds the name of the file to process.
+/// * `num_threads` - An optional number of threads to use for parallel processing.
+///                   If None, it uses the number of available CPU cores.
+/// * `options` - An `AbbreviationOptions` struct containing extraction configuration options.
+///
+/// # Returns
+///
+/// Returns an `ExtractionResult` which contains:
+/// * `extractions`: A vector of successfully extracted `AbbreviationDefinition`s.
+/// * `errors`: A vector of `ExtractionError`s that occurred during processing.
+///
+/// # Errors
+///
+/// This function will return an `ExtractionResult` with errors if:
+/// * The file cannot be opened (IOError).
+/// * The thread pool cannot be created (ThreadPoolError).
+/// * Any processing errors occur during extraction (ProcessingError).
+///
+/// # Example
+///
+/// ```
+/// use abbreviation_extractor::{extract_abbreviations_from_file, AbbreviationOptions, FileExtractionOptions};
+/// let result = extract_abbreviations_from_file(
+///     "input.txt",
+///     AbbreviationOptions::default(),
+///     FileExtractionOptions::default(),
+/// );
+/// println!("Extracted {} abbreviations", result.extractions.len());
+/// println!("Encountered {} errors", result.errors.len());
+/// ```
+pub fn extract_abbreviations_from_file(
+    filename: &str,
+    abbreviation_options: AbbreviationOptions,
+    file_extraction_options: FileExtractionOptions,
+) -> ExtractionResult {
+    // Attempt to open the file
+    let file = match File::open(filename) {
+        Ok(f) => f,
+        Err(e) => {
+            return ExtractionResult {
+                extractions: Vec::new(),
+                errors: vec![ExtractionError::IOError(e.to_string())],
+            }
+        }
+    };
+
+    // Get the file size for the progress bar
+    let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let chunk_size = min(file_size, file_extraction_options.chunk_size as u64) as usize;
+
+    // Create a buffered reader with a specified chunk size
+    let reader = BufReader::with_capacity(chunk_size, file);
+
+    // Set up a channel for communication between threads
+    let (tx, rx) = mpsc::channel();
+    let tx = Arc::new(Mutex::new(tx));
+
+    // Determine the number of threads to use
+    let thread_count = file_extraction_options.num_threads;
+
+    // Create a thread pool for parallel processing
+    let pool = match rayon::ThreadPoolBuilder::new()
+        .num_threads(thread_count)
+        .build()
+    {
+        Ok(p) => p,
+        Err(e) => {
+            return ExtractionResult {
+                extractions: Vec::new(),
+                errors: vec![ExtractionError::ThreadPoolError(e.to_string())],
+            }
+        }
+    };
+
+    // Create a progress bar if show_progress is true
+    let pb = if file_extraction_options.show_progress {
+        let pb = ProgressBar::new(file_size);
+        pb.set_style(
+            ProgressStyle::default_bar()
+                .template("{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})")
+                .unwrap_or_else(|e| {
+                    eprintln!("Failed to set progress bar template: {}", e);
+                    ProgressStyle::default_bar()
+                })
+                .progress_chars("#>-")
+        );
+        Some(pb)
+    } else {
+        None
+    };
+
+    // Spawn a thread to read the file and distribute work
+    thread::spawn(move || {
+        let mut buffer = String::with_capacity(chunk_size);
+        let mut bytes_read = 0;
+
+        // Read the file line by line
+        for line in reader.lines().filter_map(|line| line.ok()) {
+            buffer.push_str(&line);
+            buffer.push('\n');
+            bytes_read += line.len() as u64 + 1; // Add 1 for the newline character
+
+            // Process the buffer when it reaches or exceeds the chunk size
+            if buffer.len() >= chunk_size {
+                let chunk_to_process = buffer.clone();
+                let chunk_options = abbreviation_options.clone();
+                let tx = Arc::clone(&tx);
+
+                // Spawn a task to process the chunk
+                pool.spawn(move || {
+                    // Use catch_unwind to handle potential panics
+                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                        let mut results = extract_abbreviation_definition_pairs_wrapper(
+                            &chunk_to_process,
+                            chunk_options,
+                        );
+
+                        // Apply filtering options if specified
+                        if chunk_options.most_common_definition {
+                            results = select_most_common_definitions(results);
+                        } else if chunk_options.first_definition {
+                            results = select_first_definitions(results);
+                        }
+
+                        Ok(results)
+                    }));
+
+                    // Handle the result of processing
+                    let send_result = match result {
+                        Ok(Ok(results)) => Ok(results),
+                        Ok(Err(e)) => Err(e),
+                        Err(panic_error) => {
+                            let error_msg = panic_error
+                                .downcast_ref::<&str>()
+                                .map(|s| s.to_string())
+                                .or_else(|| panic_error.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| {
+                                    "Unknown panic occurred during abbreviation extraction"
+                                        .to_string()
+                                });
+                            Err(ExtractionError::ProcessingError(error_msg))
+                        }
+                    };
+
+                    // Send the result back through the channel
+                    tx.lock().unwrap().send(send_result).unwrap();
+                });
+                buffer.clear();
+            }
+
+            // Update the progress bar if it exists
+            if let Some(pb) = &pb {
+                pb.set_position(bytes_read);
+            }
+        }
+
+        // Process any remaining content in the buffer
+        if !buffer.is_empty() {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| {
+                let mut results = extract_abbreviation_definition_pairs_wrapper(
+                    &buffer,
+                    abbreviation_options.clone(),
+                );
+
+                // Apply filtering options to the final chunk
+                if abbreviation_options.most_common_definition {
+                    results = select_most_common_definitions(results);
+                } else if abbreviation_options.first_definition {
+                    results = select_first_definitions(results);
+                }
+
+                Ok(results)
+            }));
+
+            // Handle the result of processing the final chunk
+            let send_result = match result {
+                Ok(Ok(results)) => Ok(results),
+                Ok(Err(e)) => Err(e),
+                Err(panic_error) => {
+                    let error_msg = panic_error
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic_error.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| {
+                            "Unknown panic occurred during abbreviation extraction".to_string()
+                        });
+                    Err(ExtractionError::ProcessingError(error_msg))
+                }
+            };
+
+            // Send the final result through the channel
+            tx.lock().unwrap().send(send_result).unwrap();
+        }
+
+        // Signal that we're done sending chunks by dropping the sender
+        drop(tx);
+
+        // Finish the progress bar if it exists
+        if let Some(pb) = pb {
+            pb.finish_with_message("File processing completed");
+        }
+    });
+
+    // Collect results from all processed chunks
+    let mut extractions = Vec::new();
+    let mut errors = Vec::new();
+
+    // Receive results from the channel
+    for result in rx {
+        match result {
+            Ok(chunk_results) => extractions.extend(chunk_results),
+            Err(e) => errors.push(e),
+        }
+    }
+
+    // Return the final ExtractionResult
+    ExtractionResult {
+        extractions,
+        errors,
+    }
 }
 
 /// Selects the most common definitions for each abbreviation.
@@ -346,6 +624,10 @@ pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
 
     // Main loop to find candidates
     loop {
+        if close_index >= sent_bytes.len() {
+            break;
+        }
+
         // Look for open parenthesis. Need leading whitespace to avoid matching mathematical and chemical formulae
         let open_index = sent_bytes[close_index..]
             .windows(2)
@@ -384,6 +666,10 @@ pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
                 if skip {
                     close_index = open_index + 1;
                     continue;
+                }
+
+                if close_index <= 0 {
+                    break;
                 }
 
                 // Extract the candidate from within the parentheses
@@ -455,8 +741,12 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
     let mut start: i32 = 0;
     let mut start_index: isize = (first_chars.len() - 1) as isize;
 
+    // Add a maximum iteration count to prevent infinite loops
+    let max_iterations = first_chars.len() * 2;
+    let mut iterations = 0;
+
     // Look for a sequence of tokens that could form the definition
-    while count < candidate_freq as isize {
+    while count < candidate_freq as isize && iterations < max_iterations {
         // If we've searched beyond the beginning of the tokens, return None
         if start.abs() > first_chars.len() as i32 || start_index < 0 {
             return None;
@@ -492,13 +782,17 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         }
 
         // Count the number of keys in the current potential definition
+        if start_index < 0 {
+            break;
+        }
         count = first_chars[start_index as usize..]
             .iter()
             .filter(|&&c| c == key)
             .count() as isize;
+        iterations += 1;
     }
 
-    if start_index < 0 {
+    if start_index < 0 || iterations >= max_iterations || start_index as usize >= tokens.len() {
         return None;
     }
 
@@ -516,7 +810,9 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
     }
 
     // if char before start is an hyphen, then take all character before the hyphen till we hit the start of space
-    if sentence.chars().nth(start) == Some('-') || sentence.chars().nth(start) == Some(')') {
+    if (sentence.chars().nth(start) == Some('-') || sentence.chars().nth(start) == Some(')'))
+        && start > 0
+    {
         let mut hyphen_index = start - 1;
         while hyphen_index > 0 && sentence.chars().nth(hyphen_index - 1) != Some(' ') {
             hyphen_index -= 1;
@@ -561,10 +857,13 @@ pub fn select_definition<'a>(definition: &'a Candidate<'a>, abbrev: &str) -> Opt
     let mut s_index: isize = (abbrev_chars.len() - 1) as isize;
     let mut l_index: isize = (def_chars.len() - 1) as isize;
 
+    let max_iterations = definition.text().len() + abbrev.len();
+    let mut iterations = 0;
+
     // Main loop for matching characters
     loop {
         // Exit loop if we've reached the start of either string
-        if l_index < 0 || s_index < 0 {
+        if l_index < 0 || s_index < 0 || iterations >= max_iterations {
             break;
         }
 
@@ -601,10 +900,11 @@ pub fn select_definition<'a>(definition: &'a Candidate<'a>, abbrev: &str) -> Opt
                 l_index -= 1;
             }
         }
+        iterations += 1;
     }
 
     // If we've exhausted either string without finding a match, return None
-    if l_index < 0 || s_index < 0 {
+    if l_index < 0 || s_index < 0 || iterations >= max_iterations {
         return None;
     }
 
@@ -612,7 +912,7 @@ pub fn select_definition<'a>(definition: &'a Candidate<'a>, abbrev: &str) -> Opt
 
     // Create a new candidate with the matched portion of the definition
     let new_candidate = Candidate::new(
-        &definition.text()[l_index as usize..],
+        utf8_slice_start(definition.text(), l_index as usize),
         definition.start(),
         definition.stop(),
     );
@@ -709,9 +1009,17 @@ fn safe_slice(s: &str, start: usize, end: usize) -> &str {
     s.get(start..end).unwrap_or("")
 }
 
+fn utf8_slice_start(s: &str, start_char_index: usize) -> &str {
+    match s.char_indices().nth(start_char_index) {
+        Some((byte_index, _)) => &s[byte_index..],
+        None => "",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
     fn test_best_candidates() {
@@ -909,13 +1217,15 @@ mod tests {
     fn test_extract_abbreviation_definition_pairs() {
         let text = "The World Health Organization (WHO) is a specialized agency. \
                     WHO is responsible for international public health.";
-        let result = extract_abbreviation_definition_pairs(text, AbbreviationOptions::default());
+        let result =
+            extract_abbreviation_definition_pairs(text, AbbreviationOptions::default()).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_abbreviation(&result, "WHO", "World Health Organization");
 
         let text = "The National Aeronautics and Space Administration (NASA) explores space.";
-        let result = extract_abbreviation_definition_pairs(text, AbbreviationOptions::default());
+        let result =
+            extract_abbreviation_definition_pairs(text, AbbreviationOptions::default()).unwrap();
         assert_eq!(result.len(), 1);
         assert_abbreviation(
             &result,
@@ -924,7 +1234,8 @@ mod tests {
         );
 
         let text = "Wiskott-Aldrich syndrome protein (WASP)";
-        let result = extract_abbreviation_definition_pairs(text, AbbreviationOptions::default());
+        let result =
+            extract_abbreviation_definition_pairs(text, AbbreviationOptions::default()).unwrap();
         assert_eq!(result.len(), 1);
         assert_abbreviation(&result, "WASP", "Wiskott-Aldrich syndrome protein");
     }
@@ -934,7 +1245,8 @@ mod tests {
         let text =
             "The United Nations (UN) works closely with the World Health Organization (WHO). \
                     Both UN and WHO are international organizations.";
-        let result = extract_abbreviation_definition_pairs(text, AbbreviationOptions::default());
+        let result =
+            extract_abbreviation_definition_pairs(text, AbbreviationOptions::default()).unwrap();
 
         assert_eq!(result.len(), 2);
         assert_abbreviation(&result, "UN", "United Nations");
@@ -947,7 +1259,7 @@ mod tests {
                     The World Heritage Organization (WHO) is different. \n\
                     The World Health Organization (WHO) is a UN agency.";
         let options = AbbreviationOptions::new(true, false, false);
-        let result = extract_abbreviation_definition_pairs(text, options);
+        let result = extract_abbreviation_definition_pairs(text, options).unwrap();
         assert_eq!(result.len(), 1);
         assert_abbreviation(&result, "WHO", "World Health Organization");
     }
@@ -957,7 +1269,7 @@ mod tests {
         let text = "The World Heritage Organization (WHO) is important. \
                     The World Health Organization (WHO) is different.";
         let options = AbbreviationOptions::new(false, true, false);
-        let result = extract_abbreviation_definition_pairs(text, options);
+        let result = extract_abbreviation_definition_pairs(text, options).unwrap();
 
         assert_eq!(result.len(), 1);
         assert_abbreviation(&result, "WHO", "World Heritage Organization");
@@ -968,7 +1280,7 @@ mod tests {
         expected_pairs: Vec<(&str, &str)>,
         options: AbbreviationOptions,
     ) {
-        let result = extract_abbreviation_definition_pairs(text, options);
+        let result = extract_abbreviation_definition_pairs(text, options).unwrap();
         // println!("result is {:?}", result);
         for (acronym, expected_term) in expected_pairs {
             assert_abbreviation(&result, acronym, expected_term);
@@ -1045,7 +1357,7 @@ mod tests {
             options,
         );
 
-        let result = extract_abbreviation_definition_pairs(text, options);
+        let result = extract_abbreviation_definition_pairs(text, options).unwrap();
         assert!(!result.iter().any(|ad| ad.abbreviation == "astronaut"));
         assert!(!result.iter().any(|ad| ad.abbreviation == "and brains"));
     }
@@ -1135,13 +1447,13 @@ domain and phosphatidylserines. For this purpose, mixed bilayers of 1-palmitoyl,
         ];
         let options = AbbreviationOptions::default();
         let result = extract_abbreviation_definition_pairs_parallel(texts, options);
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.extractions.len(), 2);
         assert_abbreviation(
-            &result,
+            &result.extractions,
             "NASA",
             "National Aeronautics and Space Administration",
         );
-        assert_abbreviation(&result, "ESA", "European Space Agency");
+        assert_abbreviation(&result.extractions, "ESA", "European Space Agency");
     }
 
     #[test]
@@ -1153,13 +1465,13 @@ domain and phosphatidylserines. For this purpose, mixed bilayers of 1-palmitoyl,
         ];
         let options = AbbreviationOptions::default();
         let result = extract_abbreviation_definition_pairs_parallel(texts, options);
-        assert_eq!(result.len(), 2);
+        assert_eq!(result.extractions.len(), 2);
         assert_abbreviation(
-            &result,
+            &result.extractions,
             "NASA",
             "National Aeronautics and Space Administration",
         );
-        assert_abbreviation(&result, "ESA", "European Space Agency");
+        assert_abbreviation(&result.extractions, "ESA", "European Space Agency");
     }
 
     #[test]
@@ -1190,7 +1502,7 @@ Fifth sentence with trailing newline.
 
     #[test]
     fn test_unicode_chars() {
-        let text = r#""Two kinds of mechanical valve, St. Jude Medical (SJM) and Björk-Shiley (B-S), in patients with single valve replacement have been evaluated on a view point of intravascular hemolysis.
+        let text = r#"Two kinds of mechanical valve, St. Jude Medical (SJM) and Björk-Shiley (B-S), in patients with single valve replacement have been evaluated on a view point of intravascular hemolysis.
 The World Health Organization (WHO) works globally. La Société Nationale des Chemins de fer Français (SNCF) est l'entreprise ferroviaire publique française.,
 Em português, a Organização Mundial da Saúde (OMS) é muito importante.,
 Всемирная организация здравоохранения (Воз) работает во всем мире.",
@@ -1212,6 +1524,38 @@ The Société Générale des Surveillances (SGS) is a multinational company.,
                 ("ΙΤΥΕ", "Ινστιτούτο Τεχνολογίας Υπολογιστών και Εκδόσεων"),
             ],
             options,
+        );
+    }
+
+    #[test]
+    fn test_extract_abbreviations_from_file_safe() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("benches");
+        path.push("pubmed_abstracts_20240801_to_20240809.txt");
+
+        let abbreviation_options = AbbreviationOptions::new(true, false, true);
+        let file_extraction_options = FileExtractionOptions {
+            num_threads: num_cpus::get(),
+            chunk_size: 1024 * 1024,
+            show_progress: false,
+        };
+        let result = extract_abbreviations_from_file(
+            path.to_str().unwrap(),
+            abbreviation_options,
+            file_extraction_options,
+        );
+
+        // Check that we have some successful results
+        assert!(
+            !result.extractions.is_empty(),
+            "No abbreviations were extracted"
+        );
+
+        // assert > 6200
+        assert!(
+            result.extractions.len() > 6200,
+            "Expected more than 6200 abbreviations, found {}",
+            result.extractions.len()
         );
     }
 }
