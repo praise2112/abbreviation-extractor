@@ -1,4 +1,5 @@
 use bincode::{deserialize, serialize};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::{Deserialize, Serialize};
@@ -6,7 +7,7 @@ use std::fmt;
 use std::error::Error;
 
 /// Represents an abbreviation-definition pair with its position in the text.
-#[pyclass(from_py_object)]
+#[pyclass(module = "abbreviation_extractor", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbbreviationDefinition {
     #[pyo3(get, set)]
@@ -42,7 +43,7 @@ impl AbbreviationDefinition {
 
     /// Deserializes the object from a byte string (used for Python pickling).
     pub fn __setstate__(&mut self, state: Bound<'_, PyBytes>) -> PyResult<()> {
-        *self = deserialize(state.as_bytes()).unwrap();
+        *self = deserialize(state.as_bytes()).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 
@@ -116,7 +117,7 @@ impl FileExtractionOptions {
     }
 }
 
-#[pyclass(from_py_object)]
+#[pyclass(module = "abbreviation_extractor", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExtractionError {
     ProcessingError(String),
@@ -136,7 +137,32 @@ impl fmt::Display for ExtractionError {
 
 impl Error for ExtractionError {}
 
-#[pyclass(from_py_object)]
+impl ExtractionError {
+    fn message(&self) -> &str {
+        match self {
+            ExtractionError::ProcessingError(message)
+            | ExtractionError::IOError(message)
+            | ExtractionError::ThreadPoolError(message) => message,
+        }
+    }
+}
+
+#[pymethods]
+impl ExtractionError {
+    fn __str__(&self) -> String {
+        self.to_string()
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ExtractionError.{self:?}")
+    }
+
+    fn __getnewargs__(&self) -> (String,) {
+        (self.message().to_string(),)
+    }
+}
+
+#[pyclass(module = "abbreviation_extractor", from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractionResult {
     #[pyo3(get, set)]
@@ -208,7 +234,7 @@ impl ExtractionResult {
     }
 
     pub fn __setstate__(&mut self, state: Bound<'_, PyBytes>) -> PyResult<()> {
-        *self = deserialize(state.as_bytes()).unwrap();
+        *self = deserialize(state.as_bytes()).map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(())
     }
 

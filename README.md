@@ -228,6 +228,8 @@ Below is a comparison of how the abbreviation extractor performs in comparison t
 
 For detailed API documentation, please refer to the [Rust docs](https://docs.rs/abbreviation_extractor) or the Python module docstrings.
 
+`start` and `end` are UTF-8 byte offsets of the definition within its cleaned sentence (trimmed, with quotes around parentheses removed and line breaks collapsed to single spaces), in Rust and Python alike. They are not offsets into the input text.
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.

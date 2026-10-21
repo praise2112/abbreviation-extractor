@@ -1,7 +1,5 @@
 from typing import List, Optional
 
-from sympy import false
-
 
 class AbbreviationDefinition:
     """
@@ -10,8 +8,8 @@ class AbbreviationDefinition:
     Attributes:
         abbreviation (str): The abbreviated form.
         definition (str): The full form or definition of the abbreviation.
-        start (int): The starting index of the definition in the original text.
-        end (int): The ending index of the definition in the original text.
+        start (int): UTF-8 byte offset where the definition starts, within its cleaned sentence.
+        end (int): UTF-8 byte offset where the definition ends, within its cleaned sentence.
     """
 
     abbreviation: str
@@ -40,42 +38,26 @@ class AbbreviationDefinition:
         """
         ...
 
-class ExtractionError(Exception):
+class ExtractionError:
     """
-    Represents an error that occurred during the extraction process.
-
-    Attributes:
-        error_type (str): The type of error that occurred.
-        message (str): A detailed error message.
+    An error that occurred during the extraction process: one of the variants below,
+    each holding its message in `_0`.
     """
 
-    def __init__(self, error_type: str, message: str) -> None:
-        """
-        Initialize an ExtractionError instance.
+    class ProcessingError(ExtractionError):
+        _0: str
+        def __init__(self, message: str, /) -> None: ...
 
-        Args:
-            error_type (str): The type of error that occurred.
-            message (str): A detailed error message.
-        """
-        ...
+    class IOError(ExtractionError):
+        _0: str
+        def __init__(self, message: str, /) -> None: ...
 
-    def __repr__(self) -> str:
-        """
-        Return a string representation of the ExtractionError instance.
+    class ThreadPoolError(ExtractionError):
+        _0: str
+        def __init__(self, message: str, /) -> None: ...
 
-        Returns:
-            str: A string representation of the instance.
-        """
-        ...
-
-    def __str__(self) -> str:
-        """
-        Return a string representation of the ExtractionError instance.
-
-        Returns:
-            str: A string representation of the instance.
-        """
-        ...
+    def __repr__(self) -> str: ...
+    def __str__(self) -> str: ...
 
 class ExtractionResult:
     """

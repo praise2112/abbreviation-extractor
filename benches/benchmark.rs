@@ -2,7 +2,8 @@ use abbreviation_extractor::{
     best_candidates, extract_abbreviation_definition_pairs, get_definition, select_definition,
     AbbreviationOptions, Candidate,
 };
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
+use std::hint::black_box;
 
 fn bench_best_candidates(c: &mut Criterion) {
     let sentence = "The World Health Organization (WHO) is a specialized agency of the United Nations (UN) responsible for international public health.";
