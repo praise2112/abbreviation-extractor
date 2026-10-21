@@ -7,7 +7,6 @@
 
 use crate::utils::{conditions, tokenize_and_clean, PREPOSITIONS};
 use crate::Candidate;
-use lazy_static::lazy_static;
 
 use crate::abbreviation_definitions::{
     AbbreviationDefinition, AbbreviationOptions, ExtractionError, ExtractionResult,
@@ -22,56 +21,65 @@ use std::cmp::min;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::panic::AssertUnwindSafe;
-use std::sync::{mpsc, Arc, Mutex};
-use std::{panic, thread};
+use std::panic;
+use std::sync::{mpsc, Condvar, LazyLock, Mutex};
 
-lazy_static! {
-    /// Regular expression for splitting words on whitespace or hyphens
-    static ref WORD_SPLIT_RE: Regex = Regex::new(r"[\s\-]+").unwrap();
-    /// Regular expression for cleaning sentences by removing certain punctuation around parentheses
-    static ref CLEAN_SENTENCE_RE: Regex = Regex::new(r#"(\()['"\p{Pi}]|['"\p{Pf}]([);:])"#).unwrap();
-}
+/// Regular expression for splitting words on whitespace or hyphens
+static WORD_SPLIT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[\s\-]+").unwrap());
+/// Regular expression for cleaning sentences by removing certain punctuation around parentheses
+static CLEAN_SENTENCE_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(\()['"\p{Pi}]|['"\p{Pf}]([);:])"#).unwrap());
 
-pub fn extract_abbreviation_definition_pairs_wrapper<'a>(
-    text: &'a str,
+pub fn extract_abbreviation_definition_pairs_wrapper(
+    text: &str,
     options: AbbreviationOptions,
 ) -> Vec<AbbreviationDefinition> {
+    select_definitions(extract_unfiltered(text, options.tokenize), options)
+}
+
+/// Extracts every pair from `text` in text order, before the most-common or first filters.
+fn extract_unfiltered(text: &str, tokenize: bool) -> Vec<AbbreviationDefinition> {
     if text.is_empty() {
         return Vec::new();
     }
-    // Iterate over each sentence in the input text
-    // Choose the appropriate iterator based on the 'tokenized' flag
-    let sentences: Vec<Cow<'a, str>> = if options.tokenize {
+    let sentences: Vec<Cow<str>> = if tokenize {
         tokenize_and_clean(text).collect()
     } else {
         text.split('\n').map(Cow::Borrowed).collect()
     };
 
-    // Determine whether to use parallel processing
-    let use_parallel = sentences.len() > 50;
-
-    let abbreviations: Vec<AbbreviationDefinition> = if use_parallel {
-        // Parallel processing
+    if sentences.len() > 50 && text.len() >= 64 * 1024 {
         sentences
             .par_iter()
             .flat_map(|sentence| process_sentence(sentence))
             .collect()
     } else {
-        // Sequential processing
         sentences
             .iter()
             .flat_map(|sentence| process_sentence(sentence))
             .collect()
-    };
-
-    // Process the results based on the function parameters
-    if options.most_common_definition {
-        select_most_common_definitions(abbreviations)
-    } else if options.first_definition {
-        select_first_definitions(abbreviations)
-    } else {
-        abbreviations
     }
+}
+
+/// Applies the most-common or first-definition filter that `options` asks for.
+fn select_definitions(
+    extractions: Vec<AbbreviationDefinition>,
+    options: AbbreviationOptions,
+) -> Vec<AbbreviationDefinition> {
+    if options.most_common_definition {
+        select_most_common_definitions(extractions)
+    } else if options.first_definition {
+        select_first_definitions(extractions)
+    } else {
+        extractions
+    }
+}
+
+/// Runs `extract`, turning a panic inside it into a `ProcessingError`.
+fn catch_extraction(
+    extract: impl FnOnce() -> Vec<AbbreviationDefinition>,
+) -> Result<Vec<AbbreviationDefinition>, ExtractionError> {
+    panic::catch_unwind(AssertUnwindSafe(extract))
+        .map_err(|panic_error| ExtractionError::ProcessingError(panic_message(panic_error)))
 }
 
 /// Extracts abbreviation-definition pairs from a given text.
@@ -106,21 +114,15 @@ pub fn extract_abbreviation_definition_pairs(
     text: &str,
     options: AbbreviationOptions,
 ) -> Result<Vec<AbbreviationDefinition>, ExtractionError> {
-    panic::catch_unwind(AssertUnwindSafe(|| {
-        extract_abbreviation_definition_pairs_wrapper(text, options)
-    }))
-    .map_err(|panic_error| {
-        let error_msg = panic_error
-            .downcast_ref::<&str>()
-            .map(|s| s.to_string())
-            .or_else(|| panic_error.downcast_ref::<String>().cloned())
-            .unwrap_or_else(|| "Unknown panic occurred during abbreviation extraction".to_string());
-        ExtractionError::ProcessingError(error_msg)
-    })
+    catch_extraction(|| extract_abbreviation_definition_pairs_wrapper(text, options))
 }
 
 fn process_sentence(sentence: &str) -> Vec<AbbreviationDefinition> {
     let mut abbreviations = Vec::new();
+    // Candidates sit in parentheses, and cleaning below never adds one.
+    if !sentence.contains('(') {
+        return abbreviations;
+    }
     // Clean the sentence by removing certain punctuation around parentheses
     let sentence = CLEAN_SENTENCE_RE.replace_all(&sentence, "$1$2");
     let sentence = sentence.trim();
@@ -187,41 +189,10 @@ pub fn extract_abbreviation_definition_pairs_parallel<T>(
 where
     T: AsRef<str> + Sync,
 {
-    // Convert texts to Arc for thread-safe sharing
-    let texts: Vec<Arc<str>> = texts
-        .into_par_iter()
-        .map(|t| Arc::from(t.as_ref()))
-        .collect();
-
     // Process each text in parallel
     let results: Vec<Result<Vec<AbbreviationDefinition>, ExtractionError>> = texts
         .par_iter()
-        .map(|text| {
-            panic::catch_unwind(AssertUnwindSafe(|| {
-                // Collect sentences into a Vec<Cow<str>>
-                let sentences: Vec<Cow<str>> = if options.tokenize {
-                    tokenize_and_clean(text).collect()
-                } else {
-                    text.split('\n').map(Cow::Borrowed).collect()
-                };
-
-                // Process sentences
-                sentences
-                    .into_par_iter()
-                    .flat_map(|sentence| process_sentence(&sentence))
-                    .collect()
-            }))
-            .map_err(|panic_error| {
-                let error_msg = panic_error
-                    .downcast_ref::<&str>()
-                    .map(|s| s.to_string())
-                    .or_else(|| panic_error.downcast_ref::<String>().cloned())
-                    .unwrap_or_else(|| {
-                        "Unknown panic occurred during abbreviation extraction".to_string()
-                    });
-                ExtractionError::ProcessingError(error_msg)
-            })
-        })
+        .map(|text| catch_extraction(|| extract_unfiltered(text.as_ref(), options.tokenize)))
         .collect();
 
     // Separate successful extractions and errors
@@ -235,14 +206,7 @@ where
         }
     }
 
-    // Apply post-processing based on options
-    let final_extractions = if options.most_common_definition {
-        select_most_common_definitions(all_extractions)
-    } else if options.first_definition {
-        select_first_definitions(all_extractions)
-    } else {
-        all_extractions
-    };
+    let final_extractions = select_definitions(all_extractions, options);
 
     ExtractionResult {
         extractions: final_extractions,
@@ -305,14 +269,14 @@ pub fn extract_abbreviations_from_file(
 
     // Get the file size for the progress bar
     let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
-    let chunk_size = min(file_size, file_extraction_options.chunk_size as u64) as usize;
+    // Pipes and special files report size 0
+    let chunk_size = match file_size {
+        0 => file_extraction_options.chunk_size,
+        size => min(size, file_extraction_options.chunk_size as u64) as usize,
+    };
 
     // Create a buffered reader with a specified chunk size
-    let reader = BufReader::with_capacity(chunk_size, file);
-
-    // Set up a channel for communication between threads
-    let (tx, rx) = mpsc::channel();
-    let tx = Arc::new(Mutex::new(tx));
+    let mut reader = BufReader::with_capacity(chunk_size.max(1), file);
 
     // Determine the number of threads to use
     let thread_count = file_extraction_options.num_threads;
@@ -348,135 +312,98 @@ pub fn extract_abbreviations_from_file(
         None
     };
 
-    // Spawn a thread to read the file and distribute work
-    thread::spawn(move || {
+    // Chunks are extracted unfiltered; filtering runs once over the whole file below.
+    // At most `max_in_flight` chunks wait in memory ahead of the workers.
+    let max_in_flight = 8 * pool.current_num_threads();
+    let in_flight = (Mutex::new(0usize), Condvar::new());
+    let (tx, rx) = mpsc::channel();
+    let mut read_error = None;
+    pool.in_place_scope(|scope| {
         let mut buffer = String::with_capacity(chunk_size);
+        let mut line = Vec::new();
         let mut bytes_read = 0;
+        let mut chunk_count = 0;
+        let mut send_chunk = |chunk: String| {
+            let (count, freed) = &in_flight;
+            let mut waiting = freed
+                .wait_while(count.lock().unwrap(), |waiting| *waiting >= max_in_flight)
+                .unwrap();
+            *waiting += 1;
+            drop(waiting);
 
-        // Read the file line by line
-        for line in reader.lines().filter_map(|line| line.ok()) {
-            buffer.push_str(&line);
-            buffer.push('\n');
-            bytes_read += line.len() as u64 + 1; // Add 1 for the newline character
+            let index = chunk_count;
+            chunk_count += 1;
+            let tx = tx.clone();
+            let in_flight = &in_flight;
+            scope.spawn(move |_| {
+                let result = catch_extraction(|| extract_unfiltered(&chunk, abbreviation_options.tokenize));
+                // The receiver outlives every task, so sending cannot fail.
+                let _ = tx.send((index, result));
+                *in_flight.0.lock().unwrap() -= 1;
+                in_flight.1.notify_one();
+            });
+        };
 
-            // Process the buffer when it reaches or exceeds the chunk size
-            if buffer.len() >= chunk_size {
-                let chunk_to_process = buffer.clone();
-                let chunk_options = abbreviation_options.clone();
-                let tx = Arc::clone(&tx);
-
-                // Spawn a task to process the chunk
-                pool.spawn(move || {
-                    // Use catch_unwind to handle potential panics
-                    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                        let mut results = extract_abbreviation_definition_pairs_wrapper(
-                            &chunk_to_process,
-                            chunk_options,
-                        );
-
-                        // Apply filtering options if specified
-                        if chunk_options.most_common_definition {
-                            results = select_most_common_definitions(results);
-                        } else if chunk_options.first_definition {
-                            results = select_first_definitions(results);
-                        }
-
-                        Ok(results)
-                    }));
-
-                    // Handle the result of processing
-                    let send_result = match result {
-                        Ok(Ok(results)) => Ok(results),
-                        Ok(Err(e)) => Err(e),
-                        Err(panic_error) => {
-                            let error_msg = panic_error
-                                .downcast_ref::<&str>()
-                                .map(|s| s.to_string())
-                                .or_else(|| panic_error.downcast_ref::<String>().cloned())
-                                .unwrap_or_else(|| {
-                                    "Unknown panic occurred during abbreviation extraction"
-                                        .to_string()
-                                });
-                            Err(ExtractionError::ProcessingError(error_msg))
-                        }
-                    };
-
-                    // Send the result back through the channel
-                    tx.lock().unwrap().send(send_result).unwrap();
-                });
-                buffer.clear();
+        loop {
+            line.clear();
+            match reader.read_until(b'\n', &mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    read_error = Some(ExtractionError::IOError(e.to_string()));
+                    break;
+                }
             }
+            bytes_read += line.len() as u64;
+            // Lines end in a single '\n' whether the file used '\n' or "\r\n".
+            let content = match line.strip_suffix(b"\n") {
+                Some(rest) => rest.strip_suffix(b"\r").unwrap_or(rest),
+                None => &line,
+            };
+            buffer.push_str(&String::from_utf8_lossy(content));
+            buffer.push('\n');
 
-            // Update the progress bar if it exists
+            if buffer.len() >= chunk_size {
+                send_chunk(std::mem::take(&mut buffer));
+                buffer.reserve(chunk_size);
+            }
             if let Some(pb) = &pb {
                 pb.set_position(bytes_read);
             }
         }
-
-        // Process any remaining content in the buffer
         if !buffer.is_empty() {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| {
-                let mut results = extract_abbreviation_definition_pairs_wrapper(
-                    &buffer,
-                    abbreviation_options.clone(),
-                );
-
-                // Apply filtering options to the final chunk
-                if abbreviation_options.most_common_definition {
-                    results = select_most_common_definitions(results);
-                } else if abbreviation_options.first_definition {
-                    results = select_first_definitions(results);
-                }
-
-                Ok(results)
-            }));
-
-            // Handle the result of processing the final chunk
-            let send_result = match result {
-                Ok(Ok(results)) => Ok(results),
-                Ok(Err(e)) => Err(e),
-                Err(panic_error) => {
-                    let error_msg = panic_error
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic_error.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| {
-                            "Unknown panic occurred during abbreviation extraction".to_string()
-                        });
-                    Err(ExtractionError::ProcessingError(error_msg))
-                }
-            };
-
-            // Send the final result through the channel
-            tx.lock().unwrap().send(send_result).unwrap();
-        }
-
-        // Signal that we're done sending chunks by dropping the sender
-        drop(tx);
-
-        // Finish the progress bar if it exists
-        if let Some(pb) = pb {
-            pb.finish_with_message("File processing completed");
+            send_chunk(buffer);
         }
     });
+    drop(tx);
+    if let Some(pb) = pb {
+        pb.finish_with_message("File processing completed");
+    }
 
-    // Collect results from all processed chunks
+    // Put chunk results back in file order
+    let mut chunk_results: Vec<_> = rx.iter().collect();
+    chunk_results.sort_unstable_by_key(|(index, _)| *index);
     let mut extractions = Vec::new();
     let mut errors = Vec::new();
-
-    // Receive results from the channel
-    for result in rx {
+    for (_, result) in chunk_results {
         match result {
-            Ok(chunk_results) => extractions.extend(chunk_results),
+            Ok(chunk_extractions) => extractions.extend(chunk_extractions),
             Err(e) => errors.push(e),
         }
     }
-
-    // Return the final ExtractionResult
+    errors.extend(read_error);
     ExtractionResult {
-        extractions,
+        extractions: select_definitions(extractions, abbreviation_options),
         errors,
     }
+}
+
+fn panic_message(panic_error: Box<dyn std::any::Any + Send>) -> String {
+    panic_error
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| panic_error.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "Unknown panic occurred during abbreviation extraction".to_string())
 }
 
 /// Selects the most common definitions for each abbreviation.
@@ -491,37 +418,46 @@ pub fn extract_abbreviations_from_file(
 fn select_most_common_definitions(
     abbrevs: Vec<AbbreviationDefinition>,
 ) -> Vec<AbbreviationDefinition> {
-    // Create a nested HashMap to count occurrences of each definition for each abbreviation
-    let mut definition_counts: FxHashMap<String, FxHashMap<String, usize>> = FxHashMap::default();
+    // Whether each pair's definition is (one of) the most common for its abbreviation
+    let is_most_common: Vec<bool> = {
+        let mut counts: FxHashMap<&str, FxHashMap<&str, usize>> = FxHashMap::default();
+        for abbrev in &abbrevs {
+            *counts
+                .entry(&abbrev.abbreviation)
+                .or_default()
+                .entry(&abbrev.definition)
+                .or_default() += 1;
+        }
+        let max_counts: FxHashMap<&str, usize> = counts
+            .iter()
+            .map(|(abbreviation, definitions)| (*abbreviation, *definitions.values().max().unwrap()))
+            .collect();
+        abbrevs
+            .iter()
+            .map(|abbrev| {
+                counts[abbrev.abbreviation.as_str()][abbrev.definition.as_str()]
+                    == max_counts[abbrev.abbreviation.as_str()]
+            })
+            .collect()
+    };
 
-    // Count the occurrences of each definition for each abbreviation
-    for abbrev in &abbrevs {
-        definition_counts
-            .entry(abbrev.abbreviation.clone())
-            .or_insert_with(FxHashMap::default)
-            .entry(abbrev.definition.clone())
-            .and_modify(|count| *count += 1)
-            .or_insert(1);
-    }
-
-    // Create a HashMap to store the most common definition for each abbreviation
-    let mut most_common: FxHashMap<String, AbbreviationDefinition> = FxHashMap::default();
-
-    // Find the most common definition for each abbreviation
-    for abbrev in abbrevs {
-        if let Some(counts) = definition_counts.get(&abbrev.abbreviation) {
-            if let Some(max_count) = counts.values().max() {
-                if counts.get(&abbrev.definition) == Some(max_count) {
-                    most_common
-                        .entry(abbrev.abbreviation.clone())
-                        .or_insert(abbrev);
-                }
+    // Keep the first such pair per abbreviation, in the order each abbreviation first appears
+    let mut slot_of: FxHashMap<String, usize> = FxHashMap::default();
+    let mut most_common: Vec<Option<AbbreviationDefinition>> = Vec::new();
+    for (abbrev, is_most_common) in abbrevs.into_iter().zip(is_most_common) {
+        let slot = match slot_of.get(&abbrev.abbreviation) {
+            Some(&slot) => slot,
+            None => {
+                most_common.push(None);
+                slot_of.insert(abbrev.abbreviation.clone(), most_common.len() - 1);
+                most_common.len() - 1
             }
+        };
+        if is_most_common && most_common[slot].is_none() {
+            most_common[slot] = Some(abbrev);
         }
     }
-
-    // Convert the HashMap values to a Vec
-    most_common.into_values().collect()
+    most_common.into_iter().flatten().collect()
 }
 
 /// Selects the first definition for each abbreviation.
@@ -610,7 +546,7 @@ fn get_potential_synonyms<'a>(candidate: &'a Candidate<'a>) -> Vec<Candidate<'a>
 /// # Returns
 ///
 /// A vector of `Candidate` structs representing potential abbreviations.
-pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
+pub fn best_candidates(sentence: &str) -> Vec<Candidate<'_>> {
     // Convert the sentence to bytes for efficient character comparisons
     let sent_bytes = sentence.as_bytes();
 
@@ -668,10 +604,6 @@ pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
                     continue;
                 }
 
-                if close_index <= 0 {
-                    break;
-                }
-
                 // Extract the candidate from within the parentheses
                 let start = open_index + 1;
                 let stop = close_index - 1;
@@ -704,11 +636,29 @@ pub fn best_candidates(sentence: &str) -> Vec<Candidate> {
 ///
 /// An `Option<Candidate>` representing the potential definition, if found.
 pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Option<Candidate<'a>> {
-    // Convert the part of the sentence before the candidate to lowercase
-    let lowercase_sentence = sentence[..candidate.start().saturating_sub(2)].to_lowercase();
-
-    // Split the lowercase sentence into tokens (words)
-    let tokens: Vec<&str> = WORD_SPLIT_RE.split(&lowercase_sentence).collect();
+    // Words before the candidate's " (": where each starts, and its first character in lowercase
+    // Everything before the " (" that opens the candidate
+    let open_paren = sentence[..candidate.start()].rfind('(').unwrap_or(0);
+    let prefix = &sentence[..open_paren.saturating_sub(1)];
+    let mut word_starts = Vec::new();
+    let mut first_chars = Vec::new();
+    let mut word_start = 0;
+    let separators = WORD_SPLIT_RE
+        .find_iter(prefix)
+        .map(|m| (m.start(), m.end()))
+        .chain([(prefix.len(), prefix.len())]);
+    for (separator_start, separator_end) in separators {
+        if let Some(c) = prefix[word_start..separator_start].chars().next() {
+            word_starts.push(word_start);
+            first_chars.push(c.to_lowercase().next().unwrap_or(c));
+        }
+        word_start = separator_end;
+    }
+    // A definition starting at word `i` is cut from the separator character just before it.
+    let definition_start = |i: usize| match prefix[..word_starts[i]].chars().next_back() {
+        Some(separator) if i > 0 => word_starts[i] - separator.len_utf8(),
+        _ => 0,
+    };
 
     // Get the first character of the candidate (the key we're looking for)
     let key = candidate
@@ -718,10 +668,7 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         .and_then(|c| c.to_lowercase().next())
         .unwrap_or('\0'); // Default to null character if no key is found
 
-    // Create a vector of the first characters of each token
-    let first_chars: Vec<char> = tokens.iter().filter_map(|t| t.chars().next()).collect();
-
-    // Count how many times the key appears at the start of tokens in the definition
+    // Count how many times the key appears at the start of words in the definition
     let definition_freq = first_chars.iter().filter(|&&c| c == key).count();
 
     // Count how many times the key appears in the candidate
@@ -733,7 +680,7 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         .count();
 
     // If there are fewer occurrences of the key in the definition than in the candidate, return None
-    if candidate_freq > definition_freq {
+    if candidate_freq > definition_freq || first_chars.is_empty() {
         return None;
     }
 
@@ -745,9 +692,9 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
     let max_iterations = first_chars.len() * 2;
     let mut iterations = 0;
 
-    // Look for a sequence of tokens that could form the definition
+    // Look for a sequence of words that could form the definition
     while count < candidate_freq as isize && iterations < max_iterations {
-        // If we've searched beyond the beginning of the tokens, return None
+        // If we've searched beyond the beginning of the words, return None
         if start.abs() > first_chars.len() as i32 || start_index < 0 {
             return None;
         }
@@ -759,19 +706,7 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
             start_index = (slice_start + position) as isize;
 
             // Check if the potential definition starts with a preposition or conjunction
-            let sniffer_start = tokens[..start_index as usize].join(" ").len();
-            // extract up to 4 characters from the sentence starting at sniffer_start, handling Unicode also
-            let preposition = match sentence.get(sniffer_start..) {
-                Some(s) => s
-                    .char_indices()
-                    .take(4)
-                    .map(|(_, c)| c)
-                    .collect::<String>()
-                    .trim()
-                    .to_string(),
-                None => String::new(),
-            };
-            if PREPOSITIONS.is_match(&preposition) {
+            if PREPOSITIONS.is_match(&sentence[word_starts[start_index as usize]..]) {
                 // If it does, adjust our search
                 start -= 1;
                 if start_index == 0 {
@@ -792,12 +727,12 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         iterations += 1;
     }
 
-    if start_index < 0 || iterations >= max_iterations || start_index as usize >= tokens.len() {
+    if start_index < 0 || iterations >= max_iterations {
         return None;
     }
 
     // We found enough keys in the definition, so construct the definition candidate
-    let start = tokens[..start_index as usize].join(" ").len();
+    let start = definition_start(start_index as usize);
     let stop = candidate.start() - 1;
     let mut candidate_text = safe_slice(sentence, start, stop);
 
@@ -809,12 +744,13 @@ pub fn get_definition<'a>(candidate: &Candidate<'a>, sentence: &'a str) -> Optio
         return None;
     }
 
-    // if char before start is an hyphen, then take all character before the hyphen till we hit the start of space
-    if (sentence.chars().nth(start) == Some('-') || sentence.chars().nth(start) == Some(')'))
+    // If the definition starts at a hyphen or ')', extend it back to the start of that word
+    if matches!(sentence.as_bytes().get(start), Some(b'-' | b')'))
         && start > 0
+        && !sentence.as_bytes()[start - 1].is_ascii_whitespace()
     {
         let mut hyphen_index = start - 1;
-        while hyphen_index > 0 && sentence.chars().nth(hyphen_index - 1) != Some(' ') {
+        while hyphen_index > 0 && sentence.as_bytes()[hyphen_index - 1] != b' ' {
             hyphen_index -= 1;
         }
         start = hyphen_index;
@@ -911,9 +847,10 @@ pub fn select_definition<'a>(definition: &'a Candidate<'a>, abbrev: &str) -> Opt
     l_index = walk_backwards(&def_chars, l_index);
 
     // Create a new candidate with the matched portion of the definition
+    let trimmed = utf8_slice_start(definition.text(), l_index as usize);
     let new_candidate = Candidate::new(
-        utf8_slice_start(definition.text(), l_index as usize),
-        definition.start(),
+        trimmed,
+        definition.start() + definition.text().len() - trimmed.len(),
         definition.stop(),
     );
 
@@ -1265,6 +1202,44 @@ mod tests {
     }
 
     #[test]
+    fn most_common_definitions_come_in_order_of_first_appearance() {
+        let text = "The Zeta Group (ZG) met.\nThe Alpha Bank (AB) met.\nThe Zeta Group (ZG) met again.";
+        let options = AbbreviationOptions::new(true, false, false);
+        let result = extract_abbreviation_definition_pairs(text, options).unwrap();
+        let abbreviations: Vec<&str> = result.iter().map(|ad| ad.abbreviation.as_str()).collect();
+        assert_eq!(abbreviations, ["ZG", "AB"]);
+    }
+
+    fn extract_from_temp_file(contents: &[u8], first_definition: bool) -> ExtractionResult {
+        let path = std::env::temp_dir().join(format!("abbreviation-test-{}-{first_definition}.txt", std::process::id()));
+        std::fs::write(&path, contents).unwrap();
+        let options = AbbreviationOptions::new(false, first_definition, false);
+        // Tiny chunks so every line lands in its own chunk
+        let file_options = FileExtractionOptions::new(4, 8, false);
+        let result = extract_abbreviations_from_file(path.to_str().unwrap(), options, file_options);
+        std::fs::remove_file(path).unwrap();
+        result
+    }
+
+    #[test]
+    fn file_extraction_keeps_file_order_and_filters_across_chunks() {
+        let lines: Vec<String> = (0..40)
+            .map(|i| format!("The Group Number{i} (GN{i}) met. The World Health Organization (WHO) too."))
+            .collect();
+        let result = extract_from_temp_file(lines.join("\n").as_bytes(), true);
+        let abbreviations: Vec<&str> = result.extractions.iter().map(|ad| ad.abbreviation.as_str()).collect();
+        let mut expected = vec!["GN0".to_string(), "WHO".to_string()];
+        expected.extend((1..40).map(|i| format!("GN{i}")));
+        assert_eq!(abbreviations, expected);
+    }
+
+    #[test]
+    fn file_extraction_keeps_lines_with_invalid_utf8() {
+        let result = extract_from_temp_file(b"The World Health Organization (WHO) \xff here.\r\n", false);
+        assert_abbreviation(&result.extractions, "WHO", "World Health Organization");
+    }
+
+    #[test]
     fn test_first_definition() {
         let text = "The World Heritage Organization (WHO) is important. \
                     The World Health Organization (WHO) is different.";
@@ -1498,6 +1473,48 @@ Fifth sentence with trailing newline.
             .collect();
 
         assert_eq!(result, expected);
+    }
+
+    fn single_pair(sentence: &str) -> AbbreviationDefinition {
+        let options = AbbreviationOptions::new(false, false, false);
+        let mut pairs = extract_abbreviation_definition_pairs(sentence, options).unwrap();
+        assert_eq!(pairs.len(), 1, "{pairs:?}");
+        pairs.remove(0)
+    }
+
+    #[test]
+    fn definition_offsets_survive_repeated_spaces() {
+        let sentence = "Patients had  a high heart rate (HR) today.";
+        let pair = single_pair(sentence);
+        assert_eq!(&sentence[pair.start..pair.end], "heart rate");
+    }
+
+    #[test]
+    fn multibyte_whitespace_inside_parentheses_does_not_panic() {
+        let options = AbbreviationOptions::new(false, false, false);
+        let result = extract_abbreviation_definition_pairs("We used the Beta Receptor (\u{3000}BR) today.", options);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn trimmed_definition_offsets_cover_the_returned_text() {
+        for sentence in ["Normal Heart and Lung Health (HLH) here.", "We used x -Beta Receptor (BR) today."] {
+            let pair = single_pair(sentence);
+            assert_eq!(&sentence[pair.start..pair.end], pair.definition);
+        }
+    }
+
+    #[test]
+    fn long_prepositions_are_handled_like_short_ones() {
+        let over = single_pair("The rate over Response (OR) was high.");
+        let of = single_pair("The rate of Response (OR) was high.");
+        assert_eq!((over.definition.as_str(), of.definition.as_str()), ("rate over Response", "rate of Response"));
+    }
+
+    #[test]
+    fn hyphenated_definition_start_extends_over_non_ascii_word() {
+        let pair = single_pair("Ein Über-Anti Tumor (AT) Test.");
+        assert_eq!(pair.definition, "Über-Anti Tumor");
     }
 
     #[test]

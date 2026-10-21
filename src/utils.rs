@@ -1,18 +1,51 @@
-use lazy_static::lazy_static;
-use punkt_n::params::Standard;
+use punkt_n::params::{
+    DefinesNonPrefixCharacters, DefinesNonWordCharacters, DefinesPunctuation,
+    DefinesSentenceEndings,
+};
 use punkt_n::{SentenceTokenizer, TrainingData};
 use regex::Regex;
 use std::borrow::Cow;
+use std::sync::LazyLock;
 
-lazy_static! {
-    /// This regex matches strings that have the first word as a preposition
-    pub static ref PREPOSITIONS: Regex = Regex::new(r"(?i)^\s*(and|a[st]|[io]n|of|for|to|with|by|at|from|in|on|over|under|or|like)\b").unwrap();
-    /// This regex matches strings that are all lowercase and 7 or more characters long
-    pub static ref LONG_LOWER_CASE: Regex = Regex::new(r"^\p{Ll}{7,}$").unwrap();
-    /// Sentence tokenizer for English text
-    static ref TOKENIZATION_DATA: TrainingData = TrainingData::english();
-    static ref WHITESPACE_REGEX: Regex = Regex::new(r"\s+").unwrap();
+/// This regex matches strings that have the first word as a preposition
+pub static PREPOSITIONS: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^\s*(and|a[st]|[io]n|of|for|to|with|by|at|from|in|on|over|under|or|like)\b").unwrap());
+/// This regex matches strings that are all lowercase and 7 or more characters long
+pub static LONG_LOWER_CASE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^\p{Ll}{7,}$").unwrap());
+/// Sentence tokenizer for English text
+static TOKENIZATION_DATA: LazyLock<TrainingData> = LazyLock::new(TrainingData::english);
+static WHITESPACE_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\s+").unwrap());
 
+/// The character sets of punkt's `Standard` parameters, checked without hashing.
+struct StandardCharacters;
+
+impl DefinesSentenceEndings for StandardCharacters {
+    fn is_sentence_ending(c: &char) -> bool {
+        matches!(c, '.' | '?' | '!')
+    }
+}
+
+impl DefinesNonWordCharacters for StandardCharacters {
+    fn is_nonword_char(c: &char) -> bool {
+        matches!(
+            c,
+            '?' | '!' | ')' | '"' | ';' | '}' | ']' | '*' | ':' | '@' | '\'' | '(' | '{' | '['
+        )
+    }
+}
+
+impl DefinesPunctuation for StandardCharacters {
+    fn is_punctuation(c: &char) -> bool {
+        matches!(c, ';' | ':' | ',' | '.' | '!' | '?')
+    }
+}
+
+impl DefinesNonPrefixCharacters for StandardCharacters {
+    fn is_nonprefix_char(c: &char) -> bool {
+        matches!(
+            c,
+            '(' | '"' | '`' | '{' | '[' | ':' | ';' | '&' | '#' | '*' | '@' | ')' | '}' | ']' | '-' | ','
+        )
+    }
 }
 
 /// Checks if a given candidate string meets the criteria for being a valid abbreviation.
@@ -108,11 +141,30 @@ pub fn conditions(candidate: &str) -> bool {
 /// ]);
 /// ```
 pub fn tokenize_and_clean<'a>(text: &'a str) -> impl Iterator<Item = Cow<'a, str>> + 'a {
-    SentenceTokenizer::<Standard>::new(text, &TOKENIZATION_DATA).map(|sent| {
+    SentenceTokenizer::<StandardCharacters>::new(text, &TOKENIZATION_DATA).map(|sent| {
         if sent.contains('\n') {
             Cow::Owned(WHITESPACE_REGEX.replace_all(sent.trim(), " ").into_owned())
         } else {
             Cow::Borrowed(sent.trim())
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StandardCharacters;
+    use punkt_n::params::{
+        DefinesNonPrefixCharacters, DefinesNonWordCharacters, DefinesPunctuation,
+        DefinesSentenceEndings, Standard,
+    };
+
+    #[test]
+    fn standard_characters_match_punkt_standard_sets() {
+        for c in (0..0x3000).filter_map(char::from_u32) {
+            assert_eq!(StandardCharacters::is_sentence_ending(&c), Standard::is_sentence_ending(&c), "{c:?}");
+            assert_eq!(StandardCharacters::is_nonword_char(&c), Standard::is_nonword_char(&c), "{c:?}");
+            assert_eq!(StandardCharacters::is_punctuation(&c), Standard::is_punctuation(&c), "{c:?}");
+            assert_eq!(StandardCharacters::is_nonprefix_char(&c), Standard::is_nonprefix_char(&c), "{c:?}");
+        }
+    }
 }

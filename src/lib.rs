@@ -181,9 +181,9 @@
 //! - [`utils`]: Utility functions and regular expressions used in the extraction process
 //! - [`abbreviation_definitions`]: Defines the `AbbreviationDefinition` and `AbbreviationOptions` structs
 
-use log::{error, warn};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::pybacked::PyBackedStr;
 
 pub mod abbreviation_definitions;
 pub mod candidate;
@@ -201,7 +201,16 @@ pub use extraction::{
     get_definition, select_definition,
 };
 
+/// Writes `message` to Python's `logging` under the `abbreviation_extractor` logger.
+fn log(py: Python<'_>, level: &str, message: &str) -> PyResult<()> {
+    py.import("logging")?
+        .call_method1("getLogger", ("abbreviation_extractor",))?
+        .call_method1(level, (message,))?;
+    Ok(())
+}
+
 fn handle_extraction_error(
+    py: Python<'_>,
     e: ExtractionError,
     ignore_errors: bool,
 ) -> PyResult<Vec<AbbreviationDefinition>> {
@@ -210,11 +219,18 @@ fn handle_extraction_error(
         ExtractionError::IOError(msg) => format!("IO error: {}", msg),
         ExtractionError::ThreadPoolError(msg) => format!("Thread pool error: {}", msg),
     };
+    let (level, message) = if ignore_errors {
+        ("warning", format!("Ignoring error: {}", error_msg))
+    } else {
+        ("error", error_msg.clone())
+    };
+    // A failing log handler must not replace the extraction result or error.
+    if let Err(logging_error) = log(py, level, &message) {
+        logging_error.write_unraisable(py, None);
+    }
     if ignore_errors {
-        warn!("Ignoring error: {}", error_msg);
         Ok(Vec::new())
     } else {
-        error!("{}", error_msg);
         Err(PyRuntimeError::new_err(error_msg))
     }
 }
@@ -242,6 +258,7 @@ fn handle_extraction_error(
 #[pyo3(signature = (text, most_common_definition=None, first_definition=None, tokenize=None, ignore_errors=None)
 )]
 fn py_extract_abbreviation_definition_pairs(
+    py: Python<'_>,
     text: &str,
     most_common_definition: Option<bool>,
     first_definition: Option<bool>,
@@ -254,9 +271,9 @@ fn py_extract_abbreviation_definition_pairs(
         tokenize.unwrap_or(true),
     );
     let ignore_errors = ignore_errors.unwrap_or(false);
-    match extract_abbreviation_definition_pairs(text, options) {
+    match py.detach(|| extract_abbreviation_definition_pairs(text, options)) {
         Ok(v) => Ok(v),
-        Err(e) => handle_extraction_error(e, ignore_errors),
+        Err(e) => handle_extraction_error(py, e, ignore_errors),
     }
 }
 
@@ -281,7 +298,8 @@ fn py_extract_abbreviation_definition_pairs(
 #[pyo3(name = "extract_abbreviation_definition_pairs_parallel")]
 #[pyo3(signature = (texts, most_common_definition=None, first_definition=None, tokenize=None))]
 fn py_extract_abbreviation_definition_pairs_parallel(
-    texts: Vec<String>,
+    py: Python<'_>,
+    texts: Vec<PyBackedStr>,
     most_common_definition: Option<bool>,
     first_definition: Option<bool>,
     tokenize: Option<bool>,
@@ -291,9 +309,7 @@ fn py_extract_abbreviation_definition_pairs_parallel(
         first_definition.unwrap_or(false),
         tokenize.unwrap_or(true),
     );
-    Ok(extract_abbreviation_definition_pairs_parallel(
-        texts, options,
-    ))
+    Ok(py.detach(|| extract_abbreviation_definition_pairs_parallel(texts, options)))
 }
 
 /// Extracts abbreviation-definition pairs from a file.
@@ -319,7 +335,9 @@ fn py_extract_abbreviation_definition_pairs_parallel(
 #[pyfunction]
 #[pyo3(name = "extract_abbreviations_from_file")]
 #[pyo3(signature = (file_path, most_common_definition=None, first_definition=None, tokenize=None, num_threads=None, show_progress=None, chunk_size=None))]
+#[allow(clippy::too_many_arguments)]
 fn py_extract_abbreviations_from_file(
+    py: Python<'_>,
     file_path: String,
     most_common_definition: Option<bool>,
     first_definition: Option<bool>,
@@ -339,11 +357,7 @@ fn py_extract_abbreviations_from_file(
         chunk_size.unwrap_or(1024 * 1024), // Default to 1MB if not specified
         show_progress.unwrap_or(true),
     );
-    Ok(extract_abbreviations_from_file(
-        &file_path,
-        abbreviation_options,
-        file_options,
-    ))
+    Ok(py.detach(|| extract_abbreviations_from_file(&file_path, abbreviation_options, file_options)))
 }
 
 /// Initializes the Python module.
@@ -360,7 +374,6 @@ fn py_extract_abbreviations_from_file(
 /// A `PyResult<()>` indicating success or failure of module initialization.
 #[pymodule]
 fn abbreviation_extractor(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    pyo3_log::init();
     m.add_function(wrap_pyfunction!(
         py_extract_abbreviation_definition_pairs,
         m
@@ -370,5 +383,8 @@ fn abbreviation_extractor(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(py_extract_abbreviations_from_file, m)?)?;
+    m.add_class::<AbbreviationDefinition>()?;
+    m.add_class::<ExtractionError>()?;
+    m.add_class::<ExtractionResult>()?;
     Ok(())
 }
