@@ -6,7 +6,7 @@ use std::fmt;
 use std::error::Error;
 
 /// Represents an abbreviation-definition pair with its position in the text.
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AbbreviationDefinition {
     #[pyo3(get, set)]
@@ -48,7 +48,7 @@ impl AbbreviationDefinition {
 
     /// Serializes the object to a byte string (used for Python pickling).
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new_bound(py, &serialize(&self).unwrap()))
+        Ok(PyBytes::new(py, &serialize(&self).unwrap()))
     }
 
     /// Returns the arguments needed to recreate this object (used for Python pickling).
@@ -116,7 +116,7 @@ impl FileExtractionOptions {
     }
 }
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ExtractionError {
     ProcessingError(String),
@@ -136,7 +136,7 @@ impl fmt::Display for ExtractionError {
 
 impl Error for ExtractionError {}
 
-#[pyclass]
+#[pyclass(from_py_object)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExtractionResult {
     #[pyo3(get, set)]
@@ -213,7 +213,7 @@ impl ExtractionResult {
     }
 
     pub fn __getstate__<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new_bound(py, &serialize(&self).unwrap()))
+        Ok(PyBytes::new(py, &serialize(&self).unwrap()))
     }
 
     fn __getnewargs__(&self) -> PyResult<(Vec<AbbreviationDefinition>, Vec<ExtractionError>)> {
